@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <elf.h>
 
 // Color Definition
@@ -29,11 +30,14 @@ void printEhdrInfo(Elf64_Ehdr);
 void printPhdrs(Elf64_Ehdr, FILE*, Elf64_Phdr*);                     
 void printPhdrInfo(Elf64_Phdr);
 // SHDR
-void printShdrs(Elf64_Ehdr, FILE*, Elf64_Shdr*);                     
+char *getShStrTab(Elf64_Ehdr, FILE*);
+void printShdrs(Elf64_Ehdr, FILE*, Elf64_Shdr*, char*);                     
 void printShdrInfo(Elf64_Shdr, const char*);
 // SYMTAB
 void printSymtab(Elf64_Shdr*, Elf64_Ehdr, FILE*);
 void printSymtabInfo(Elf64_Sym, const char*);
+// DECODING
+void IDTest(Elf64_Ehdr, Elf64_Shdr*, FILE*, char*);
 
 // HELPERS
 const char *getSectionTypeName(uint32_t);
@@ -86,13 +90,27 @@ int main() {
 
     //  SECTION HEADERS
     Elf64_Shdr *sheaders = malloc(header.e_shnum * sizeof(Elf64_Shdr));
-    printShdrs(header, file, sheaders);
+    char *shstrtab = getShStrTab(header, file);
+    if (!shstrtab) {
+        printf("Failed to load String Table");
+        free(pheaders);
+        free(sheaders);
+        fclose(file);
+        return 1;
+    }
+    getShStrTab(header, file);
+    printShdrs(header, file, sheaders, shstrtab);
+    printShdrs(header, file, sheaders, shstrtab);
 
     //  SYMBOL TABLE
     printSymtab(sheaders, header, file);
 
+    //  DECODING
+    IDTest(header, sheaders, file, shstrtab);
+
     free(pheaders);
     free(sheaders);
+    free(shstrtab);
     fclose(file);
 }
 
@@ -303,18 +321,22 @@ void printPhdrInfo(Elf64_Phdr ph) {
     printf("%08lX ", ph.p_align);
 }
 
-void printShdrs(Elf64_Ehdr EH, FILE* F, Elf64_Shdr* sHeaders) {
+char *getShStrTab(Elf64_Ehdr EH, FILE* F) {
     //  SHNAME STRTAB
     Elf64_Shdr shstrtab_hdr;
     Elf64_Off shstrtab_offset = EH.e_shoff + (EH.e_shstrndx * EH.e_shentsize);
     
     fseek(F, shstrtab_offset, SEEK_SET);
     fread(&shstrtab_hdr, sizeof(Elf64_Shdr), 1, F);
-    
+
     char* shstrtab = malloc(shstrtab_hdr.sh_size);
     fseek(F, shstrtab_hdr.sh_offset, SEEK_SET);
     fread(shstrtab, 1, shstrtab_hdr.sh_size, F);
 
+    return(shstrtab);
+}
+
+void printShdrs(Elf64_Ehdr EH, FILE* F, Elf64_Shdr* sHeaders, char* shstrtab) {
     fseek(F, EH.e_shoff, SEEK_SET);
     fread(sHeaders, EH.e_shentsize, EH.e_shnum, F); // Index sHeaders
 
@@ -328,8 +350,6 @@ void printShdrs(Elf64_Ehdr EH, FILE* F, Elf64_Shdr* sHeaders) {
             printBorder();
         }
     }
-
-    free(shstrtab);
 }
 
 void printShdrInfo(Elf64_Shdr sh, const char* strtab) {
@@ -495,7 +515,35 @@ void printSymtabInfo(Elf64_Sym symEnt, const char* strtab) {
 
 }
 
+void IDTest(Elf64_Ehdr EH, Elf64_Shdr* sHeaders, FILE* F, char* shstrtab) {
+    Elf64_Shdr txtHdr;
+    unsigned char *txtSection = {0};
 
+    for(int i = 0; i < EH.e_shnum; i++) {
+        if(strcmp(shstrtab + sHeaders[i].sh_name, ".text") == 0) {
+            txtHdr = sHeaders[i];
+        }
+    }
+
+    if (&txtHdr != NULL) {
+        txtSection = malloc(txtHdr.sh_size);
+    }
+
+    fseek(F, txtHdr.sh_offset, SEEK_SET);
+    fread(txtSection, txtHdr.sh_size, 1, F);
+    for (int i = 0; i < txtHdr.sh_size; i++) {
+        if (i % 8 == 0) {
+            printf("0x%08lx: ", txtHdr.sh_addr + i);
+        }
+
+        printf("%02X ", txtSection[i]);
+
+        if((i + 1) % 8 == 0) {
+            printf("\n");
+        }
+    }
+    printBorder();
+}
 
 
 
