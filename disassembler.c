@@ -8,6 +8,21 @@
 #include <string.h>
 #include <elf.h>
 
+// Structs
+typedef struct {
+    Elf64_Shdr header;
+    unsigned char *bytes;
+    int found;
+} LoadedSection;
+
+typedef struct {
+    uint64_t address;
+    unsigned char bytes[16];
+    size_t length;
+    char mnemonic[32];
+    char operands[96];
+} Instruction;
+
 // Color Definition
     // normal
 #define C_RED           "\x1b[38;5;196m"
@@ -37,7 +52,11 @@ void printShdrInfo(Elf64_Shdr, const char*);
 void printSymtab(Elf64_Shdr*, Elf64_Ehdr, FILE*);
 void printSymtabInfo(Elf64_Sym, const char*);
 // DECODING
-void IDTest(Elf64_Ehdr, Elf64_Shdr*, FILE*, char*);
+LoadedSection loadSectionByName(Elf64_Ehdr, Elf64_Shdr*, FILE*, char*, const char*);
+void decodeTextSection(const unsigned char*, size_t, uint64_t);
+void disassembleSection(Elf64_Ehdr, Elf64_Shdr*, FILE*, char*);
+size_t decodeInstruction(const unsigned char*, size_t, uint64_t, Instruction*);
+
 
 // HELPERS
 const char *getSectionTypeName(uint32_t);
@@ -98,15 +117,13 @@ int main() {
         fclose(file);
         return 1;
     }
-    getShStrTab(header, file);
-    printShdrs(header, file, sheaders, shstrtab);
     printShdrs(header, file, sheaders, shstrtab);
 
     //  SYMBOL TABLE
     printSymtab(sheaders, header, file);
 
     //  DECODING
-    IDTest(header, sheaders, file, shstrtab);
+    disassembleSection(header, sheaders, file, shstrtab);
 
     free(pheaders);
     free(sheaders);
@@ -515,35 +532,108 @@ void printSymtabInfo(Elf64_Sym symEnt, const char* strtab) {
 
 }
 
-void IDTest(Elf64_Ehdr EH, Elf64_Shdr* sHeaders, FILE* F, char* shstrtab) {
-    Elf64_Shdr txtHdr;
-    unsigned char *txtSection = {0};
-
+LoadedSection loadSectionByName(Elf64_Ehdr EH, Elf64_Shdr* sHeaders, FILE* F, char* shstrtab, const char *name) {
+    LoadedSection result = {0};
+    
     for(int i = 0; i < EH.e_shnum; i++) {
-        if(strcmp(shstrtab + sHeaders[i].sh_name, ".text") == 0) {
-            txtHdr = sHeaders[i];
+        if(strcmp(shstrtab + sHeaders[i].sh_name, name) == 0) {
+            result.header = sHeaders[i];
+            result.found = 1;
+            break;
         }
     }
 
-    if (&txtHdr != NULL) {
-        txtSection = malloc(txtHdr.sh_size);
+    if (!result.found) {
+        return result;
+    }
+    if (result.header.sh_size == 0) {
+        return result;
     }
 
-    fseek(F, txtHdr.sh_offset, SEEK_SET);
-    fread(txtSection, txtHdr.sh_size, 1, F);
-    for (int i = 0; i < txtHdr.sh_size; i++) {
-        if (i % 8 == 0) {
-            printf("0x%08lx: ", txtHdr.sh_addr + i);
-        }
-
-        printf("%02X ", txtSection[i]);
-
-        if((i + 1) % 8 == 0) {
-            printf("\n");
-        }
+    result.bytes = malloc(result.header.sh_size);
+    if(!result.bytes) {
+        result.found = 0;
+        return result;
     }
-    printBorder();
+
+    fseek(F, result.header.sh_offset, SEEK_SET);
+    if(fread(result.bytes,1, result.header.sh_size, F) != result.header.sh_size) {
+        free(result.bytes);
+        result.bytes = NULL;
+        result.found = 0;
+        return result;
+    }
+
+    return result;
 }
+
+void decodeTextSection(const unsigned char *bytes, size_t size, uint64_t baseAddr) {
+    size_t offset = 0;
+
+    while (offset < size) {
+        Instruction inst = {0};
+        size_t len = decodeInstruction(bytes+offset, size-offset, baseAddr + offset, &inst);
+
+        if (len == 0) {
+            inst.address = baseAddr + offset;
+            inst.bytes[0] = bytes[offset];
+            inst.length = 1;
+            snprintf(inst.mnemonic, sizeof(inst.mnemonic), "db");
+            snprintf(inst.operands, sizeof(inst.operands), "0x%02X", bytes[offset]);
+            len = 1;
+        }
+
+        char byteStr[64] = {0};
+        char *p = byteStr;
+
+        for (size_t i = 0; i < inst.length; i++) {
+            p += snprintf(p, sizeof(byteStr) - (p - byteStr), "%02X ", inst.bytes[i]);
+        }
+
+        printf(" [0x\x1b[38;5;202m%08lx\x1b[0m]: %-20s %s %s\n", inst.address, byteStr, inst.mnemonic, inst.operands);
+
+        offset += len;
+    }
+}
+
+void disassembleSection(Elf64_Ehdr EH, Elf64_Shdr *sHeaders, FILE *F, char *shstrtab) {
+    printf("Disassembly of section [.text]:\n");    
+
+    LoadedSection text = loadSectionByName(EH, sHeaders, F, shstrtab, ".text"); // Just do .text for now
+    if (!text.found) {
+        printf("No data found.\n");
+        return;
+    }
+
+    decodeTextSection(text.bytes, text.header.sh_size, text.header.sh_addr);
+    free(text.bytes);
+}
+
+size_t decodeInstruction(const unsigned char* code, size_t maxLength, uint64_t addr, Instruction *inst) {
+    size_t offset = 0;
+    memset(inst, 0, sizeof(*inst));
+    inst->address = addr;
+
+    // endbr64
+    if (maxLength >= 4 &&
+        code[0] == 0xF3 &&
+        code[1] == 0x0F &&
+        code[2] == 0x1E &&
+        code[3] == 0xFA) {
+        
+        inst->bytes[0] = code[0];
+        inst->bytes[1] = code[1];
+        inst->bytes[2] = code[2];
+        inst->bytes[3] = code[3];
+        inst->length = 4;
+        snprintf(inst->mnemonic, sizeof(inst->mnemonic), "endbr64");
+        return 4;
+    }
+
+    return 0;
+}
+
+
 
 
 
