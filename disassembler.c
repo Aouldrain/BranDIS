@@ -1,4 +1,4 @@
-/**TO-DO
+/**Eventual Additions
  * --------------------------------------------
  *  1. Add OP and PROC to both program and section headers under optional inclusion field at end of row with no header that doesn't show up normally.
 **/
@@ -22,6 +22,26 @@ typedef struct {
     char mnemonic[32];
     char operands[96];
 } Instruction;
+
+typedef struct {
+    unsigned char legacy[4];
+    int legacy_count;
+
+    int has_rex;
+    unsigned char rex;
+
+    int operand_size_override;  // 0x66
+    int address_size_override;  // 0x67
+    int lock;   // F0
+    int repne;  // F2
+    int rep;    // F3
+} PrefixState;
+
+typedef struct {
+    uint8_t mod;
+    uint8_t reg;
+    uint8_t rm;
+} ModRM;
 
 // Color Definition
     // normal
@@ -57,6 +77,14 @@ void decodeTextSection(const unsigned char*, size_t, uint64_t);
 void disassembleSection(Elf64_Ehdr, Elf64_Shdr*, FILE*, char*);
 size_t decodeInstruction(const unsigned char*, size_t, uint64_t, Instruction*);
 
+//  Decoding helpers
+int isPrefix(unsigned char);
+size_t parsePrefixes(const unsigned char*, size_t, PrefixState*);
+int parseOpcode (const unsigned char*, size_t, PrefixState*, Instruction*, size_t);
+int parseModRM (const unsigned char*, size_t, ModRM*, PrefixState*, Instruction*, size_t);
+const char* getRegister(uint8_t, uint8_t);
+
+
 
 // HELPERS
 const char *getSectionTypeName(uint32_t);
@@ -86,6 +114,11 @@ const char *sFlag_Values2[] = {"----", "M---", "-S--", "MS--", "--I-", "M-I-", "
         "M--L", "-S-L", "MS-L", "--IL", "M-IL", "-SIL", "MSIL"};
 const char *sFlag_Values3[] = {"----", "O---", "-G--", "OG--", "--T-", "O-T-", "-GT-", "OGT-", "---C" ,
         "O--C", "-G-C", "OG-C", "--TC", "O-TC", "-GTC", "OGTC"};
+
+// Register tables
+const char *bit16[] = { "ax",  "cx",  "dx",  "bx",  "sp",  "bp",  "si",  "di"  };
+const char *bit32[] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi" };
+const char *bit64[] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi" };
 
 int main() {
     // Banner and title
@@ -184,6 +217,8 @@ const char *getProgramTypeName(uint32_t type) {
             return "UNKNOWN";
     }
 }
+
+// HEADERS
 
 void printEhdr(Elf64_Ehdr *EH, FILE* F) {
     fread(EH, sizeof(Elf64_Ehdr), 1, F);    //read ehdr
@@ -532,6 +567,8 @@ void printSymtabInfo(Elf64_Sym symEnt, const char* strtab) {
 
 }
 
+// DECODE
+
 LoadedSection loadSectionByName(Elf64_Ehdr EH, Elf64_Shdr* sHeaders, FILE* F, char* shstrtab, const char *name) {
     LoadedSection result = {0};
     
@@ -610,30 +647,150 @@ void disassembleSection(Elf64_Ehdr EH, Elf64_Shdr *sHeaders, FILE *F, char *shst
 }
 
 size_t decodeInstruction(const unsigned char* code, size_t maxLength, uint64_t addr, Instruction *inst) {
+    PrefixState ps;
     size_t offset = 0;
+
     memset(inst, 0, sizeof(*inst));
     inst->address = addr;
 
-    // endbr64
-    if (maxLength >= 4 &&
-        code[0] == 0xF3 &&
-        code[1] == 0x0F &&
-        code[2] == 0x1E &&
-        code[3] == 0xFA) {
-        
-        inst->bytes[0] = code[0];
-        inst->bytes[1] = code[1];
-        inst->bytes[2] = code[2];
-        inst->bytes[3] = code[3];
-        inst->length = 4;
-        snprintf(inst->mnemonic, sizeof(inst->mnemonic), "endbr64");
-        return 4;
+    offset = parsePrefixes(code, maxLength, &ps);
+
+    for (size_t i = 0; i < offset; i++) {
+        inst->bytes[i] = code[i];
+    }
+    inst->length = offset;
+
+    if (offset >= maxLength) {
+        return 0;
     }
 
-    return 0;
+    int opcodeParsed = parseOpcode(code, maxLength, &ps, inst, offset); 
+
+    if (opcodeParsed == 1) {
+        return inst->length;
+    } else {
+        return 0;
+    }
 }
 
+// Decode Helper Functions
+int isPrefix(unsigned char b) {
+    if (b >= 0x40 && b <= 0x4F)
+        return 1; // REX
+    switch (b) {
+        case 0xF0:
+        case 0xF2:
+        case 0xF3:
+        case 0x2E:
+        case 0x36:
+        case 0x3E:
+        case 0x26:
+        case 0x64:
+        case 0x65:
+        case 0x66:
+        case 0x67:
+            return 1;
+        default:
+            return 0;
+    }
+}
 
+size_t parsePrefixes(const unsigned char* code, size_t maxLength, PrefixState *ps) {
+    size_t offset = 0;
+    memset(ps, 0, sizeof(*ps));
+
+    while (offset < maxLength && isPrefix(code[offset])) {
+        unsigned char b = code[offset];
+
+        if (b >= 0x40 && b <= 0x4F) {
+            ps->rex = b;
+            ps->has_rex = 1;
+        } else {
+            if (ps->legacy_count < 4) {
+                ps->legacy[ps->legacy_count] = b;
+                ps->legacy_count++;
+            }
+
+            switch (b) {
+                case 0xF3: ps->rep = 1; break;
+                case 0x66: ps->operand_size_override = 1; break;
+            }
+        }
+        offset++;
+    }
+    return offset;
+}
+
+int parseOpcode (const unsigned char* code, size_t maxLength, PrefixState *ps, Instruction *inst, size_t offset) {
+    // ENDBR64
+    if (code[offset] == 0x0F) {
+        if(offset + 2 < maxLength) {
+            unsigned char op1 = code[offset + 1];
+            unsigned char op2 = code[offset + 2];
+            if (ps->rep == 1 && op1 == 0x1E && op2 == 0xFA) {
+                inst->bytes[inst->length++] = code[offset++];
+                inst->bytes[inst->length++] = code[offset++];
+                inst->bytes[inst->length++] = code[offset++];
+                snprintf(inst->mnemonic, sizeof(inst->mnemonic), "endbr64");
+                return 1;   // Success
+            }
+        }
+    }
+
+    // 31
+    if (code[offset] == 0x31) {
+        ModRM rm;
+        snprintf(inst->mnemonic, sizeof(inst->mnemonic), "xor");
+        inst->bytes[inst->length++] = code[offset];
+
+        int ModRMparsed = parseModRM(code, maxLength, &rm, ps, inst, offset);      
+        return ModRMparsed;    
+    }
+
+    return 0; // Fail
+}
+
+int parseModRM (const unsigned char* code, size_t maxLength, ModRM *rm, PrefixState *ps, Instruction *inst, size_t offset) {
+    if (offset + 1 >= maxLength) {
+        return 0;   // No byte at offset+1
+    }
+    
+    // Splits up modR/M byte
+    uint8_t byte = code[offset + 1];
+
+    rm->mod = (byte >> 6) & 0x03;
+    rm->reg = (byte >> 3) & 0x07;
+    rm->rm  = byte & 0x07;
+
+    inst->bytes[inst->length++] = byte;
+
+    // determine width
+    uint8_t width;
+    if (ps->has_rex && (ps->rex & 0x08)) {  // rex.w
+        width = 64;
+    } else if (ps->operand_size_override == 1) {
+        width = 16;
+    } else {
+        width = 32;
+    }
+    
+    if (rm->mod == 3) {
+        snprintf(inst->operands, sizeof(inst->operands), "%s, %s", getRegister(rm->rm, width), getRegister(rm->reg, width));
+        return 1;
+    }
+}
+
+const char* getRegister(uint8_t reg, uint8_t width) {
+    if (width == 16) {
+        return bit16[reg];
+    } else if (width == 32) {
+        return bit32[reg];
+    } else if (width == 64) {
+        return bit64[reg];
+    } else {
+        return "???";
+    }
+}
 
 
 
