@@ -29,6 +29,10 @@ typedef struct {
 
     int has_rex;
     unsigned char rex;
+    int rexW;
+    int rexR;
+    int rexX;
+    int rexB;
 
     int operand_size_override;  // 0x66
     int address_size_override;  // 0x67
@@ -82,9 +86,9 @@ int isPrefix(unsigned char);
 size_t parsePrefixes(const unsigned char*, size_t, PrefixState*);
 int parseOpcode (const unsigned char*, size_t, PrefixState*, Instruction*, size_t);
 int parseModRM (const unsigned char*, size_t, ModRM*, PrefixState*, Instruction*, size_t);
-const char* getRegister(uint8_t, uint8_t);
-
-
+const char* getRegisterLegacy(uint8_t, uint8_t);
+const char* getRegisterREX(uint8_t, uint8_t);
+const char* detExtension(ModRM);
 
 // HELPERS
 const char *getSectionTypeName(uint32_t);
@@ -130,6 +134,11 @@ const char *bit64[] = {
     "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
     "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"
 };
+
+// REX Register tables
+const char *rex16[] = {"r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
+const char *rex32[] = {"r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"};
+const char *rex64[] = {"r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"};
 
 int main() {
     // Banner and title
@@ -713,10 +722,15 @@ size_t parsePrefixes(const unsigned char* code, size_t maxLength, PrefixState *p
     while (offset < maxLength && isPrefix(code[offset])) {
         unsigned char b = code[offset];
 
-        if (b >= 0x40 && b <= 0x4F) {
+        if (b >= 0x40 && b <= 0x4F) {   // Parse REX
             ps->rex = b;
             ps->has_rex = 1;
-        } else {
+
+            ps->rexW = (ps->rex >> 3) & 0x01;
+            ps->rexR = (ps->rex >> 2) & 0x01;
+            ps->rexX = (ps->rex >> 1) & 0x01;
+            ps->rexB = ps->rex & 0x01; 
+        } else {    // Parse Legacy
             if (ps->legacy_count < 4) {
                 ps->legacy[ps->legacy_count] = b;
                 ps->legacy_count++;
@@ -764,7 +778,7 @@ int parseOpcode (const unsigned char* code, size_t maxLength, PrefixState *ps, I
     // 31: XOR r/m
     if (code[offset] == 0x31) {
         ModRM rm;
-        snprintf(inst->mnemonic, sizeof(inst->mnemonic), "xor");
+        snprintf(inst->mnemonic, sizeof(inst->mnemonic), "XOR");
         inst->bytes[inst->length++] = code[offset];
 
         return parseModRM(code, maxLength, &rm, ps, inst, offset); 
@@ -818,6 +832,32 @@ int parseOpcode (const unsigned char* code, size_t maxLength, PrefixState *ps, I
         return 1;
     }
 
+    // 89 - MOV
+    if (code[offset] == 0x89) {
+        ModRM rm;
+        snprintf(inst->mnemonic, sizeof(inst->mnemonic), "MOV");
+        inst->bytes[inst->length++] = code[offset];
+
+        int ModRMparsed = parseModRM(code, maxLength, &rm, ps, inst, offset);
+        return ModRMparsed;
+    }
+
+    // 5E - POP RSI
+    if (code[offset] == 0x5E) {
+        snprintf(inst->mnemonic, sizeof(inst->mnemonic), "POP rsi");
+        inst->bytes[inst->length++] = code[offset];
+        return 1;
+    }
+
+    // 83 - ADD, OR, ADC, SBB, AND, SUB, XOR, CMP - Immediate to Register/Memory
+    if (code[offset] == 0x83) {
+        ModRM rm;
+        inst->bytes[inst->length++] = code[offset];
+        int ModRMparsed = parseModRM(code, maxLength, &rm, ps, inst, offset);
+        snprintf(inst->mnemonic, sizeof(inst->mnemonic), "%s", detExtension(rm));
+
+        return ModRMparsed;
+    }
     return 0; // Fail
 }
 
@@ -837,7 +877,7 @@ int parseModRM (const unsigned char* code, size_t maxLength, ModRM *rm, PrefixSt
 
     // determine width
     uint8_t width;
-    if (ps->has_rex && (ps->rex & 0x08)) {  // rex.w
+    if (ps->has_rex && ps->rexW == 1) {
         width = 64;
     } else if (ps->operand_size_override == 1) {
         width = 16;
@@ -882,6 +922,34 @@ const char* getRegister(uint8_t reg, uint8_t width) {
     } else {
         return "???";
     }
+}
+
+const char* getRegisterREX(uint8_t reg, uint8_t width) {
+    if (width == 16) {
+        return rex16[reg];
+    } else if (width == 32) {
+        return rex32[reg];
+    } else if (width == 64) {
+        return rex64[reg];
+    } else {
+        return "???";
+    }
+}
+
+const char* detExtension(ModRM rm) {
+    const char* detOP;
+    switch(rm.reg) {
+        case 0: detOP = "ADD"; break;
+        case 1: detOP = "OR"; break;
+        case 2: detOP = "ADC"; break;
+        case 3: detOP = "SBB"; break;
+        case 4: detOP = "AND"; break;
+        case 5: detOP = "SUB"; break;
+        case 6: detOP = "XOR"; break;
+        case 7: detOP = "CMP"; break;
+        default: detOP = "???"; break;
+    }
+    return detOP;
 }
 
 
