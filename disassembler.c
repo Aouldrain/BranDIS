@@ -116,9 +116,20 @@ const char *sFlag_Values3[] = {"----", "O---", "-G--", "OG--", "--T-", "O-T-", "
         "O--C", "-G-C", "OG-C", "--TC", "O-TC", "-GTC", "OGTC"};
 
 // Register tables
-const char *bit16[] = { "ax",  "cx",  "dx",  "bx",  "sp",  "bp",  "si",  "di"  };
-const char *bit32[] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi" };
-const char *bit64[] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi" };
+const char *bit16[] = {
+    "ax",  "cx",  "dx",  "bx",  "sp",  "bp",  "si",  "di",
+    "r8w", "r9w", "r10w","r11w","r12w","r13w","r14w","r15w"
+};
+
+const char *bit32[] = {
+    "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
+    "r8d", "r9d", "r10d","r11d","r12d","r13d","r14d","r15d"
+};
+
+const char *bit64[] = {
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+    "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"
+};
 
 int main() {
     // Banner and title
@@ -712,8 +723,21 @@ size_t parsePrefixes(const unsigned char* code, size_t maxLength, PrefixState *p
             }
 
             switch (b) {
-                case 0xF3: ps->rep = 1; break;
-                case 0x66: ps->operand_size_override = 1; break;
+                case 0xF0:
+                    ps->lock = 1;
+                    break;
+                case 0xF2:
+                    ps->repne = 1;
+                    break;
+                case 0xF3:
+                    ps->rep = 1;
+                    break;
+                case 0x66:
+                    ps->operand_size_override = 1;
+                    break;
+                case 0x67:
+                    ps->address_size_override = 1;
+                    break;
             }
         }
         offset++;
@@ -737,14 +761,61 @@ int parseOpcode (const unsigned char* code, size_t maxLength, PrefixState *ps, I
         }
     }
 
-    // 31
+    // 31: XOR r/m
     if (code[offset] == 0x31) {
         ModRM rm;
         snprintf(inst->mnemonic, sizeof(inst->mnemonic), "xor");
         inst->bytes[inst->length++] = code[offset];
 
-        int ModRMparsed = parseModRM(code, maxLength, &rm, ps, inst, offset);      
-        return ModRMparsed;    
+        return parseModRM(code, maxLength, &rm, ps, inst, offset); 
+    }
+
+    // 89: MOV r/m, r
+    if (code[offset] == 0x89) {
+        ModRM rm;
+        snprintf(inst->mnemonic, sizeof(inst->mnemonic), "mov");
+        inst->bytes[inst->length++] = code[offset];
+
+        return parseModRM(code, maxLength, &rm, ps, inst, offset);
+    }
+
+    // 50-57: PUSH r64
+    if (code[offset] >= 0x50 && code[offset] <= 0x57) {
+        if (ps->lock) {
+            return 0;
+        }
+
+        uint8_t reg = code[offset] - 0x50;
+
+        inst->bytes[inst->length++] = code[offset];
+        snprintf(inst->mnemonic, sizeof(inst->mnemonic), "push");
+        snprintf(inst->operands, sizeof(inst->operands), "%s", getRegister(reg, 64));
+        return 1;
+    }
+
+    // 58-5F: POP r64
+    if (code[offset] >= 0x58 && code[offset] <= 0x5F) {
+        if (ps->lock) {
+            return 0;
+        }
+
+        uint8_t reg = code[offset] - 0x58;
+
+        inst->bytes[inst->length++] = code[offset];
+        snprintf(inst->mnemonic, sizeof(inst->mnemonic), "pop");
+        snprintf(inst->operands, sizeof(inst->operands), "%s", getRegister(reg, 64));
+        return 1;
+    }
+
+    // C3: RET
+    if (code[offset] == 0xC3) {
+        if (ps->lock) {
+            return 0;
+        }
+
+        inst->bytes[inst->length++] = code[offset];
+        snprintf(inst->mnemonic, sizeof(inst->mnemonic), "ret");
+        return 1;
     }
 
     return 0; // Fail
@@ -773,14 +844,35 @@ int parseModRM (const unsigned char* code, size_t maxLength, ModRM *rm, PrefixSt
     } else {
         width = 32;
     }
+
+    uint8_t reg_index = rm->reg;
+    uint8_t rm_index  = rm->rm;
+    
+    if (ps->has_rex) {
+        if (ps->rex & 0x04) { // REX.R
+            reg_index += 8;
+        }
+        if (ps->rex & 0x01) { // REX.B
+            rm_index += 8;
+        }
+    }
     
     if (rm->mod == 3) {
-        snprintf(inst->operands, sizeof(inst->operands), "%s, %s", getRegister(rm->rm, width), getRegister(rm->reg, width));
+        snprintf(inst->operands, sizeof(inst->operands),
+                 "%s, %s",
+                 getRegister(rm_index, width),
+                 getRegister(reg_index, width));
         return 1;
     }
+    
+    return 0;
 }
 
 const char* getRegister(uint8_t reg, uint8_t width) {
+    if (reg >= 16) {
+        return "???";
+    }
+
     if (width == 16) {
         return bit16[reg];
     } else if (width == 32) {
